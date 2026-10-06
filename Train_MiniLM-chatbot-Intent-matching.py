@@ -12,17 +12,25 @@ from transformers import (
     DataCollatorWithPadding
 )
 
-# 1. Load raw JSON dataset (CLINC150 data_full)
-dataset_path = "./clinc150/clinc150_uci/data_full.json"
+# 1. Load dataset with Out-of-Scope (OOS) data (CLINC150 data_oos_plus)
+dataset_path = "./clinc150/clinc150_uci/data_oos_plus.json"
 with open(dataset_path, "r", encoding="utf-8") as f:
     raw_data = json.load(f)
 
-# Extract and map 150 unique in-domain intent classes to integers
-unique_intents = sorted(list(set(x[1] for x in raw_data["train"])))
+# Merge in-domain and out-of-scope (OOS) samples for each split:
+# - train: 15,000 in-domain + 250 oos = 15,250 samples
+# - val:    3,000 in-domain + 100 oos =  3,100 samples
+# - test:   4,500 in-domain + 1,000 oos = 5,500 samples
+train_data = raw_data["train"] + raw_data["oos_train"]
+val_data = raw_data["val"] + raw_data["oos_val"]
+test_data = raw_data["test"] + raw_data["oos_test"]
+
+# Extract 151 intent labels (150 in-domain + 'oos' fallback class)
+unique_intents = sorted(list(set(x[1] for x in train_data)))
 label2id = {label: idx for idx, label in enumerate(unique_intents)}
 id2label = {idx: label for idx, label in enumerate(unique_intents)}
 num_labels = len(unique_intents)
-print(f"Loaded {num_labels} unique intent classes.")
+print(f"Loaded {num_labels} unique intent classes (including 'oos' fallback).")
 
 # Helper to convert list of [text, intent] pairs to HF Dataset with numeric label
 def make_split(split_data):
@@ -30,11 +38,11 @@ def make_split(split_data):
     df["label"] = df["intent"].map(label2id)
     return Dataset.from_pandas(df)
 
-# Create Hugging Face DatasetDict with train, validation, and test splits
+# Create Hugging Face DatasetDict
 dataset = DatasetDict({
-    "train": make_split(raw_data["train"]),       
-    "validation": make_split(raw_data["val"]),       
-    "test": make_split(raw_data["test"]),            
+    "train": make_split(train_data),       
+    "validation": make_split(val_data),       
+    "test": make_split(test_data),            
 })
 print("Dataset structure:\n", dataset)
 
@@ -48,7 +56,6 @@ model = AutoModelForSequenceClassification.from_pretrained(
     id2label=id2label,
     label2id=label2id
 )
-
 
 # max_length=64 covers 100% of samples without wasteful padding
 def tokenize_function(examples):
@@ -73,12 +80,12 @@ def compute_metrics(eval_pred):
 use_fp16 = torch.cuda.is_available() and not torch.cuda.is_bf16_supported()
 use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
-# 4. Training Arguments tailored for CLINC150 & MiniLM
+# 4. Training Arguments tailored for CLINC150 (151 classes) & MiniLM
 # Math:
-#   Train samples = 15,000
-#   Batch size = 64 -> ~235 steps per epoch
-#   Epochs = 5 -> Total steps = ~1,175
-#   Warmup (10%) = ~118 steps (or warmup_ratio=0.1)
+#   Train samples = 15,250
+#   Batch size = 64 -> ~239 steps per epoch
+#   Epochs = 5 -> Total steps = ~1,195
+#   Warmup (10%) = ~120 steps
 training_args = TrainingArguments(
     output_dir="./models/minilm_intent_matching_checkpoints",
     num_train_epochs=5,
@@ -86,7 +93,7 @@ training_args = TrainingArguments(
     per_device_eval_batch_size=64,
     learning_rate=3e-5,
     weight_decay=0.01,
-    warmup_steps=118,
+    warmup_steps=120,                          # 10% warmup (~120 steps for 5 epochs)
     logging_steps=50,
     eval_strategy="epoch",                     
     save_strategy="epoch",                     
@@ -119,7 +126,7 @@ print("\n--- Evaluating on Validation Set ---")
 val_results = trainer.evaluate(eval_dataset=tokenized_val_data)
 print("Validation Results:", val_results)
 
-print("\n--- Evaluating on Unseen Test Set ---")
+print("\n--- Evaluating on Unseen Test Set (including 1,000 OOS queries) ---")
 test_results = trainer.evaluate(eval_dataset=tokenized_test_data)
 print("Test Results:", test_results)
 
