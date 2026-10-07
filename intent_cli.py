@@ -8,7 +8,9 @@ confidence scoring, OOS fallback detection, and rich terminal output.
 """
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -46,6 +48,12 @@ def load_model(model_path: str):
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForSequenceClassification.from_pretrained(model_path)
+    calibration_path = Path(model_path) / "confidence_calibration.json"
+    if calibration_path.exists():
+        with calibration_path.open(encoding="utf-8") as calibration_file:
+            calibration = json.load(calibration_file)
+    else:
+        calibration = {"temperature": 1.0, "oos_threshold": 0.0, "max_length": 64}
 
     # Device selection: CUDA → CPU
     if torch.cuda.is_available():
@@ -76,36 +84,48 @@ def load_model(model_path: str):
 
     print(styled(f"[OK] Model loaded  ", Style.GREEN, Style.BOLD)
           + styled(f"({num_labels} classes, device: {device_label})", Style.DIM))
-    return tokenizer, model, device, id2label
+    print(styled(
+        f"[i] Confidence temperature={calibration['temperature']:.3f}, "
+        f"OOS threshold={calibration['oos_threshold']:.4f}",
+        Style.DIM,
+    ))
+    return tokenizer, model, device, id2label, calibration
 
 
 # ──────────────────────────── Inference ────────────────────────────────────────
-def predict(text: str, tokenizer, model, device, id2label, threshold: float):
+def predict(text: str, tokenizer, model, device, id2label, calibration, threshold=None):
     """Run inference and return formatted results."""
+    temperature = float(calibration.get("temperature", 1.0))
+    max_length = int(calibration.get("max_length", 64))
+    threshold = float(
+        calibration.get("oos_threshold", 0.0) if threshold is None else threshold
+    )
     inputs = tokenizer(
         text,
         return_tensors="pt",
         truncation=True,
-        max_length=128,
+        max_length=max_length,
     ).to(device)
 
     with torch.no_grad():
         logits = model(**inputs).logits
 
-    probs = F.softmax(logits, dim=-1).squeeze(0)
+    probs = F.softmax(logits / max(temperature, 1e-6), dim=-1).squeeze(0)
     top_k = torch.topk(probs, k=min(4, len(probs)))
 
     top_id    = top_k.indices[0].item()
     top_score = top_k.values[0].item()
-    top_label = id2label.get(top_id, id2label.get(str(top_id), f"LABEL_{top_id}"))
+    raw_top_label = id2label.get(top_id, id2label.get(str(top_id), f"LABEL_{top_id}"))
 
-    low_conf = top_score < threshold
-
+    rejected_as_oos = top_label_is_oos = raw_top_label == "oos"
+    if top_score < threshold and raw_top_label != "oos":
+        rejected_as_oos = True
+    top_label = "oos" if rejected_as_oos else raw_top_label
     # ── Header: predicted intent ──────────────────────────────────────────
     conf_pct = f"{top_score * 100:.1f}%"
-    if low_conf:
+    if rejected_as_oos:
         conf_colour = Style.YELLOW
-        badge = styled(" LOW CONFIDENCE ", Style.BOLD, Style.BG_YELLOW, Style.WHITE)
+        badge = styled(" OUT OF SCOPE ", Style.BOLD, Style.BG_YELLOW, Style.WHITE)
     else:
         conf_colour = Style.GREEN
         badge = ""
@@ -116,8 +136,12 @@ def predict(text: str, tokenizer, model, device, id2label, threshold: float):
     print(f"  |  >>  Predicted Intent:  {intent_display}")
     print(f"  |  %%  Confidence:        {styled(conf_pct, conf_colour, Style.BOLD)}  {badge}")
 
-    if low_conf:
-        print(f"  |  {styled('[!] Score below threshold -- may be out-of-scope.', Style.YELLOW)}")
+    if rejected_as_oos:
+        if top_label_is_oos:
+            message = "Model classified this request as out-of-scope."
+        else:
+            message = f"Rejected as out-of-scope; strongest intent match was {raw_top_label}."
+        print(f"  |  {styled('[!] ' + message, Style.YELLOW)}")
 
     print(styled("  +---------------------------------------------------+", Style.DIM))
 
@@ -162,19 +186,19 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="./models/minilm_intent_matching/final",
+        default="./models/minilm_intent_matching_improved/final",
         help="Path to the fine-tuned model directory "
-             "(default: ./models/minilm_intent_matching/final)",
+             "(default: ./models/minilm_intent_matching_improved/final)",
     )
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.50,
-        help="Confidence threshold for low-confidence / OOS warning (default: 0.50)",
+        default=None,
+        help="Override the validation-calibrated confidence threshold for OOS rejection.",
     )
     args = parser.parse_args()
 
-    tokenizer, model, device, id2label = load_model(args.model_path)
+    tokenizer, model, device, id2label, calibration = load_model(args.model_path)
     banner()
 
     while True:
@@ -192,7 +216,7 @@ def main():
             print(styled("[~] Goodbye!", Style.CYAN, Style.BOLD))
             break
 
-        predict(text, tokenizer, model, device, id2label, args.threshold)
+        predict(text, tokenizer, model, device, id2label, calibration, args.threshold)
 
 
 if __name__ == "__main__":
