@@ -9,8 +9,12 @@ confidence scoring, OOS fallback detection, and rich terminal output.
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+from typing import Optional
+
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import torch
 import torch.nn.functional as F
@@ -42,18 +46,33 @@ def styled(text: str, *codes: str) -> str:
 
 
 # ──────────────────────────── Model loader ────────────────────────────────────
-def load_model(model_path: str):
+def load_model(model_path: str = "Kami0867/MiniLM-L12-Intent-Matching", revision: Optional[str] = None):
     """Load tokenizer & model, resolve device, and extract id2label."""
     print(styled("[*] Loading model and tokenizer ...", Style.DIM))
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+    pretrained_kwargs = {}
+    if revision:
+        pretrained_kwargs["revision"] = revision
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, **pretrained_kwargs)
+    model = AutoModelForSequenceClassification.from_pretrained(model_path, **pretrained_kwargs)
     calibration_path = Path(model_path) / "confidence_calibration.json"
-    if calibration_path.exists():
+    if calibration_path.is_file():
         with calibration_path.open(encoding="utf-8") as calibration_file:
             calibration = json.load(calibration_file)
     else:
-        calibration = {"temperature": 1.0, "oos_threshold": 0.0, "max_length": 64}
+        # Load calibrated parameters from Hugging Face Hub if model_path is a repository ID
+        try:
+            from huggingface_hub import hf_hub_download
+            calib_file = hf_hub_download(
+                repo_id=model_path,
+                filename="confidence_calibration.json",
+                **pretrained_kwargs,
+            )
+            with open(calib_file, "r", encoding="utf-8") as calibration_file:
+                calibration = json.load(calibration_file)
+        except Exception:
+            calibration = {"temperature": 1.0, "oos_threshold": 0.0, "max_length": 64}
 
     # Device selection: CUDA → CPU
     if torch.cuda.is_available():
@@ -186,9 +205,16 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="./models/minilm_intent_matching_improved/final",
-        help="Path to the fine-tuned model directory "
-             "(default: ./models/minilm_intent_matching_improved/final)",
+        default="Kami0867/MiniLM-L12-Intent-Matching",
+        help="Path to the fine-tuned model directory or Hugging Face Hub repository "
+             "(default: Kami0867/MiniLM-L12-Intent-Matching)",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Optional model revision or commit hash on Hugging Face Hub "
+             "(e.g., 11d37c733b9bed728da33405400591b408fe59c1).",
     )
     parser.add_argument(
         "--threshold",
@@ -198,7 +224,7 @@ def main():
     )
     args = parser.parse_args()
 
-    tokenizer, model, device, id2label, calibration = load_model(args.model_path)
+    tokenizer, model, device, id2label, calibration = load_model(args.model_path, args.revision)
     banner()
 
     while True:
